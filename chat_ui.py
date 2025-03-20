@@ -1,6 +1,7 @@
 import streamlit as st
 import anthropic
 from typing import Dict, Any, List
+from PIL import Image
 
 SYSTEM_PROMPT = """あなたは量子アニーリングを活用してタスクの割り振りを最適化し、曖昧な要望を明確なタスクスケジュールへ変換する高度なAIエージェントとして振る舞ってください。
 ユーザーが入力した曖昧な要望を受け取り、以下のステップに従い、必要に応じてユーザーから不足情報を仮想的にヒアリングしながら、一度の応答で処理結果を提示してください。
@@ -39,9 +40,23 @@ JSON形式で出力してください。
 つまり、thinkingブロックには質問や説明を表示し、チャットの出力には最適化結果のみを表示してください。
 """
 
+EXAMPLE_TASKS = [
+    "新規Webサービスの開発プロジェクトを3ヶ月以内に完了させたい。チームメンバーは5人です。",
+    "社内の業務効率化のため、既存の紙ベースの申請プロセスをデジタル化したい。予算は500万円で、来年度第1四半期までに完了させたい。",
+    "新製品のローンチイベントを2ヶ月後に予定しているが、どう進めればいいか分からない。",
+    "複数の部署が関わる大規模なシステム移行プロジェクトを半年以内に完了させる必要がある。影響範囲が広く、ダウンタイムを最小限に抑えたい。"
+]
+
 def initialize_session_state():
     if "messages" not in st.session_state:
         st.session_state.messages = []
+    if "example_tasks" not in st.session_state:
+        st.session_state.example_tasks = EXAMPLE_TASKS
+        st.session_state.example_task_buttons = [st.empty() for _ in range(len(EXAMPLE_TASKS))]
+    if "example_used" not in st.session_state:
+        st.session_state.example_used = False
+    if "selected_task" not in st.session_state:
+        st.session_state.selected_task = ""
     return st.session_state.messages
 
 def display_chat_history(messages: List[Dict[str, Any]]):
@@ -54,77 +69,97 @@ def update_message_history(messages: List[Dict[str, Any]], contents: Dict[str, A
         if content["text"] != "":
             messages.append({"role": "assistant", "content": [{"type": "text", "text": content["text"]}]})
 
+def process_input(client, messages, prompt):
+    with st.chat_message("user"):
+        st.write(prompt)
+    
+    messages.append({"role": "user", "content": [{"type": "text", "text": prompt}]})
 
-def main():
-    st.markdown("""
-        <script>
-        window.addEventLinstener('load', function() {
-            setTimeout(function() {
-                const input = document.querySelector('textarea');
-                console.log(input);
-                if (input) {
-                    input.focus();
-                }
-            }, 1000);
-        });
-        </script>
-    """, unsafe_allow_html=True)
+    try:
+        contents = {} # コンテンツ保存用辞書
+        outputs = {} # UI出力保存用辞書
 
-    st.title("QuaLLM")
+        with client.messages.stream(
+            model="claude-3-7-sonnet-20250219",
+            max_tokens=20000,
+            temperature=1.0,
+            system=SYSTEM_PROMPT,
+            thinking={"type": "enabled", "budget_tokens": 16000},
+            messages=messages
+        ) as stream:
+            for event in stream:
+                if event.type == "content_block_start":
+                    block_index = str(event.index)
+                    if block_index not in contents:
+                        contents[block_index] = {"text": "", "thinking": []}
+                    
+                    if block_index not in outputs:
+                        if event.content_block.type == "thinking":
+                            outputs[block_index] = st.expander("Thinking...", expanded=False).empty()
+                        elif event.content_block.type == "text":
+                            outputs[block_index] = st.chat_message("assistant").empty()
+                elif event.type == "content_block_delta":
+                    block_index = str(event.index)
+                    if event.delta.type == "thinking_delta":
+                        if contents[block_index]["thinking"]:
+                            contents[block_index]["thinking"][-1] += event.delta.thinking
+                        else:
+                            contents[block_index]["thinking"].append(event.delta.thinking)
+                        outputs[block_index].write("\n".join(contents[block_index]["thinking"]))
+                    elif event.delta.type == "text_delta":
+                        contents[block_index]["text"] += event.delta.text
+                        outputs[block_index].write(contents[block_index]["text"])
+    
+        update_message_history(messages, contents)
 
-    client = anthropic.Anthropic(
-        api_key=st.secrets["anthropic_api_key"],
-    )
-    messages = initialize_session_state()
+    except anthropic.AnthropicError as e:
+        st.error(f"エラー: {str(e)}")
 
-    display_chat_history(messages)
+im = Image.open("favicon.ico")
+st.set_page_config(
+    page_title="QuaLLM",
+    page_icon=im,
+    layout="wide",
+)
 
-    if prompt := st.chat_input("曖昧なタスクを入力してください"):
-        with st.chat_message("user"):
-            st.write(prompt)
-        
-        messages.append({"role": "user", "content": [{"type": "text", "text": prompt}]})
+st.markdown("""
+    <script>
+    window.addEventLinstener('load', function() {
+        setTimeout(function() {
+            const input = document.querySelector('textarea');
+            console.log(input);
+            if (input) {
+                input.focus();
+            }
+        }, 1000);
+    });
+    </script>
+""", unsafe_allow_html=True)
 
-        try:
-            contents = {} # コンテンツ保存用辞書
-            outputs = {} # UI出力保存用辞書
+st.title("QuaLLM")
 
-            with client.messages.stream(
-                model="claude-3-7-sonnet-20250219",
-                max_tokens=20000,
-                temperature=1.0,
-                system=SYSTEM_PROMPT,
-                thinking={"type": "enabled", "budget_tokens": 16000},
-                messages=messages
-            ) as stream:
-                for event in stream:
-                    if event.type == "content_block_start":
-                        block_index = str(event.index)
-                        if block_index not in contents:
-                            contents[block_index] = {"text": "", "thinking": []}
-                        
-                        if block_index not in outputs:
-                            if event.content_block.type == "thinking":
-                                outputs[block_index] = st.expander("Thinking...", expanded=False).empty()
-                            elif event.content_block.type == "text":
-                                outputs[block_index] = st.chat_message("assistant").empty()
-                    elif event.type == "content_block_delta":
-                        block_index = str(event.index)
-                        if event.delta.type == "thinking_delta":
-                            # 最後の要素がある場合は更新、なければ新規追加
-                            if contents[block_index]["thinking"]:
-                                contents[block_index]["thinking"][-1] += event.delta.thinking
-                            else:
-                                contents[block_index]["thinking"].append(event.delta.thinking)
-                            outputs[block_index].write("\n".join(contents[block_index]["thinking"]))
-                        elif event.delta.type == "text_delta":
-                            contents[block_index]["text"] += event.delta.text
-                            outputs[block_index].write(contents[block_index]["text"])
-        
-            update_message_history(messages, contents)
+client = anthropic.Anthropic(
+    api_key=st.secrets["anthropic_api_key"],
+)
+messages = initialize_session_state()
 
-        except anthropic.AnthropicError as e:
-            st.error(f"エラー: {str(e)}")
+display_chat_history(messages)
 
-if __name__ == "__main__":
-    main()
+# 例題ボタンの表示（一度も使用されていない場合のみ）
+if not st.session_state.example_used:
+    for i, task in enumerate(EXAMPLE_TASKS):
+        if st.session_state.example_task_buttons[i].button(f"{task}", key=f"example_{i}"):
+            st.session_state.example_used = True
+            st.session_state.selected_task = task
+
+if st.session_state.selected_task:
+    for button in st.session_state.example_task_buttons:
+        button.empty()
+    process_input(client, messages, st.session_state.selected_task)
+
+# 通常の入力フィールド
+if prompt := st.chat_input("曖昧なタスクを入力してください"):
+    for button in st.session_state.example_task_buttons:
+        button.empty()
+
+    process_input(client, messages, prompt)
